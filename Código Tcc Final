@@ -1,0 +1,484 @@
+/**
+Programa: TOMADA MONITORADA WIFI - TCC
+
+Descrição: Este código tem a função de realizar o monitoramento de energia através de um navegador de internet.
+
+Componentes necessários:
+1- ESP32
+2- MODULO RELE
+3- MODULO SENSOR DE CORRENTE ASC712-5A
+4- ROTEADOR COM INTERNET
+
+Autores: Luiz Filipe e Tiago Soares
+**/
+
+//Carrega as Bibliotecas
+#include <WiFi.h> 
+#include <WiFiClient.h>
+#include <WebServer.h>  
+#include <ThingSpeak.h>
+#include "EmonLib.h" 
+#include <NTPClient.h> //Biblioteca NTPClient modificada
+#include <WiFiUdp.h> //Socket UDP
+#include <SPI.h>
+
+
+#define CURRENT_CAL 1.5 //Valor de calibração (deve ser ajustado em parelelo com um multimetro medindo a corrente da carga)
+
+const int pinoSensor = 34; //Pino analógico em que o sensor está conectado
+
+EnergyMonitor emon1; //Uma instância de um monitor de energial da Emon Library.
+
+//Fuso Horário, no caso horário de verão de Brasília 
+int timeZone = -3;
+
+//Struct com os dados do dia e hora
+struct Date{
+    int dayOfWeek;
+    int day;
+    int month;
+    int year;
+    int hours;
+    int minutes;
+    int seconds;
+};
+
+//Socket UDP que a lib utiliza para recuperar dados sobre o horário
+WiFiUDP udp;
+
+//Objeto responsável por recuperar dados sobre horário
+NTPClient ntpClient(
+    udp,                    //socket udp
+    "0.br.pool.ntp.org",    //URL do servwer NTP
+    timeZone*3600,          //Deslocamento do horário em relacão ao GMT 0
+    60000);                 //Intervalo entre verificações online
+
+//Nomes dos dias da semana
+char* dayOfWeekNames[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+
+
+//Definição da rede
+#define SSID_REDE     "IOT_TREE_BLUE"  //coloque aqui o nome da rede que se deseja conectar
+#define SENHA_REDE    "98550526"  //coloque aqui a senha da rede que se deseja conectar
+
+
+// ThingSpeak information
+char thingSpeakAddress[] = "api.thingspeak.com";
+unsigned long channelID = 880282;
+char* readAPIKey = "8843JULUCZO27FVH";
+char* writeAPIKey = "1798Z00U2SZ8IFPV";
+unsigned int dataFieldOne = 1;                 
+unsigned int dataFieldTwo = 2;  
+unsigned int dataFieldThree = 3;  
+
+unsigned long lastConnectionTime = 0;
+long lastUpdateTime = 0; 
+WiFiClient client;
+
+
+//Variável do tipo ESP32 que já possui funções que auxiliam na criação das rotas que o ESP32 vai responder
+WebServer server ( 80 );
+
+double kwhTotal;
+double kw;
+unsigned char idx = 0;
+
+
+void setup()
+{
+  int leitura = 0;
+  int tensao = 127;
+  int potencia = (leitura*tensao);
+  int kwatt = (potencia/1000);
+
+  //Configura o GPIO19 como output, ou seja, como saida para podermos alterar o seu valor
+  pinMode(19, OUTPUT);
+  
+  //Deixa o GPIO0 e o GPIO19 com saida LOW
+  digitalWrite(19, HIGH);
+  
+  //inicia porta serial
+  Serial.begin(115200);
+  
+  //PASSA PARA A FUNÇÃO OS PARÂMETROS (PINO ANALÓGIO / VALOR DE CALIBRAÇÃO)
+  emon1.current(pinoSensor, CURRENT_CAL); 
+ 
+  Serial.println("Start");
+
+  //Conecta a rede wifi configurada
+  connectWiFi();
+ 
+ //Mostramos no Monitor Serial o ip com o qual o esp8266 se conectou para ver se está de acordo com o que configuramos
+ Serial.println("");
+ Serial.println("Connectado!");
+ Serial.print ("IP: ");
+ Serial.println(WiFi.localIP()); 
+ 
+
+  //Quando houver uma requisição http do tipo GET no caminho http://192.168.1.10/releon 
+  //a função getreleon será executada
+  server.on("/releon", HTTP_GET, getreleon);
+  
+  //Quando houver uma requisição http do tipo GET no caminho http://192.168.1.10/releoff 
+  //a função getreleoff será executada
+  server.on("/releoff", HTTP_GET, getreleoff);
+  
+  //Quando houver uma requisição http do tipo GET no caminho http://192.168.1.10/monitor 
+  //a função getrelemonitor será executada
+  //Esta função retornará a página principal e recarregará essas informações de tempos em tempos
+  server.on("/monitor", HTTP_GET, showMonitor);
+  
+    //Quando houver uma requisição http do tipo GET no caminho http://192.168.1.10/monitor 
+  //a função getrelemonitor será executada
+  //Esta função retornará a página principal e recarregará essas informações de tempos em tempos
+  server.on("/calcule", HTTP_GET, showCalc);
+  
+      //Quando houver uma requisição http do tipo GET no caminho http://192.168.1.10/monitor 
+  //a função getrelemonitor será executada
+  //Esta função retornará a página principal e recarregará essas informações de tempos em tempos
+  server.on("/power", HTTP_GET, showpower);
+  
+  //Aqui definimos qual função será executada caso o caminho que o cliente requisitou não tenha sido registrado
+  server.onNotFound(onNotFound);
+  
+  //Inicializamos o server que criamos na porta 80
+  server.begin();
+  Serial.println("Servidor HTTP iniciado");
+  
+  setupNTP();
+  
+    
+}
+
+void setupNTP()
+{
+    //Inicializa o client NTP
+    ntpClient.begin();
+    
+    //Espera pelo primeiro update online
+    Serial.println("Waiting for first update");
+    while(!ntpClient.update())
+    {
+        Serial.print(".");
+        ntpClient.forceUpdate();
+        delay(500);
+    }
+
+    Serial.println();
+    Serial.println("First Update Complete");
+}
+
+void loop()
+{
+
+  emon1.calcVI(20,100); //FUNÇÃO DE CÁLCULO (20 SEMICICLOS / TEMPO LIMITE PARA FAZER A MEDIÇÃO)
+  double currentDraw = emon1.Irms; //VARIÁVEL RECEBE O VALOR DE CORRENTE RMS OBTIDO
+
+   float leitura = (currentDraw);
+   int tensao = 127;
+   float potencia = ((leitura) * (tensao));
+   float kwatt = ((potencia) / (1000));
+ 
+    kw = ((potencia) / (1000));
+
+    kwhTotal = (kwhTotal + ((kw*2) * 1.0 / 3600.0 ));
+    idx++;
+   
+    Serial.print("Corrente medida: "); //IMPRIME O TEXTO NA SERIAL
+    Serial.print(leitura); 
+    Serial.println("A"); 
+
+   Serial.print("Tesão: "); //IMPRIME O TEXTO NA SERIAL
+   Serial.print(tensao);
+   Serial.println("V"); 
+  
+   Serial.print("Potencia calculada: "); //IMPRIME O TEXTO NA SERIAL
+   Serial.print(potencia);
+   Serial.println("W"); 
+   
+   Serial.print("Consumo: "); //IMPRIME O TEXTO NA SERIAL
+   Serial.print(kwhTotal);
+   Serial.println("kW/h"); 
+   
+   float kwhthingspeak  = kwhTotal*1000;
+   
+   Serial.print("ThingSpeak Value: "); //IMPRIME O TEXTO NA SERIAL
+   Serial.print(kwhthingspeak);
+   Serial.println("W/h"); 
+
+   Date date = getDate();
+  
+   Serial.print(dayOfWeekNames[date.dayOfWeek]);
+   Serial.print(" - ");
+   Serial.print(date.day); 
+   Serial.print("/");
+   Serial.print(date.month);
+   Serial.print("/");
+   Serial.print(date.year);
+   Serial.print(" - "); 
+   Serial.print(date.hours);
+   Serial.print(":");
+   Serial.print(date.minutes);
+   Serial.print(":");
+   Serial.println(date.seconds); 
+   
+   float diareset = 1;
+   float diaatual = date.day;
+   float hora = date.hours;
+   float minuto = date.minutes;
+   float segundos = date.seconds;
+   
+   
+   
+    if (diareset == diaatual && hora == 0 && minuto == 0 && segundos == 0 ){
+    kwhTotal = 0;
+   }
+
+  
+  
+  //Verifica se há alguma requisição de algum cliente
+  server.handleClient();
+    
+  //write2TSData( channelID , dataFieldOne , leitura  );
+  write2TSData( channelID , dataFieldOne , leitura , dataFieldTwo , potencia , dataFieldThree , kwhthingspeak ); 
+
+ /*  Date date = getDate();
+  
+   Serial.println(dayOfWeekNames[date.dayOfWeek]);
+   Serial.println(date.day); 
+   Serial.println(date.month);
+   Serial.println(date.year); 
+   Serial.println(date.hours);
+   Serial.println(date.minutes);
+   Serial.println(date.seconds); */
+    
+
+    delay(1000);
+}
+
+int connectWiFi(){
+    
+  Serial.println("Conectando-se à rede WiFi...");
+    Serial.println();  
+    delay(1000);
+    WiFi.begin(SSID_REDE, SENHA_REDE);
+ 
+    while (WiFi.status() != WL_CONNECTED) 
+    {
+        delay(500);
+        Serial.print(".");
+    }
+
+    
+    Serial.println( "Connected" );
+    Serial.println("IP obtido: ");
+    Serial.println(WiFi.localIP());
+  
+    ThingSpeak.begin( client );
+  
+}
+
+// Use this function if you want to write multiple fields simultaneously.
+int write2TSData( long TSChannel, unsigned int TSField1, float field1Data, unsigned int TSField2, long field2Data, unsigned int TSField3, long field3Data ){
+
+  ThingSpeak.setField( TSField1, field1Data );
+  ThingSpeak.setField( TSField2, field2Data );
+  ThingSpeak.setField( TSField3, field3Data );
+   
+  int writeSuccess = ThingSpeak.writeFields( TSChannel, writeAPIKey );
+  return writeSuccess;
+}
+
+Date getDate()
+{
+    //Recupera os dados de data e horário usando o client NTP
+    char* strDate = (char*)ntpClient.getFormattedDate().c_str();
+
+    //Passa os dados da string para a struct
+    Date date;
+    sscanf(strDate, "%d-%d-%dT%d:%d:%dZ", 
+                    &date.year, 
+                    &date.month, 
+                    &date.day, 
+                    &date.hours, 
+                    &date.minutes,
+                    &date.seconds);
+
+    //Dia da semana de 0 a 6, sendo 0 o domingo
+    date.dayOfWeek = ntpClient.getDay();
+    return date;
+}
+
+
+
+//Função que definimos para ser chamada quando o caminho requisitado não foi registrado 
+void onNotFound() 
+{
+server.send(404, "text/plain", "Not Found" );
+Serial.print("Deu Ruim!");
+}
+
+
+//Função que definimos que será executada quando o cliente fizer uma requisição do tipo GET no caminho http://192.168.1.10/releon
+void getreleon()
+{
+ digitalWrite(19, LOW);
+
+  showMonitor();
+}
+
+//Função que definimos que será executada quando o cliente fizer uma requisição do tipo GET no caminho http://192.168.1.10/releoff
+void getreleoff()
+{
+digitalWrite(19, HIGH);
+ 
+  showMonitor();
+}
+
+
+//Função que definimos que será executada quando o cliente fizer uma requisição do tipo GET no caminho http://192.168.1.10/monitor
+void showMonitor()
+{
+  String html =
+  "<!DOCTYPE html>"
+    "<html lang='pt-br' >"
+  "<head>"
+    "<meta charset='UFT-8' name='viewport' content='width=device-width, initial-scale=1, user-scalable=no'/>"
+    "<title>Tomada Blue</title>"
+   "<link rel='stylesheet' type='text/css' media='screen and (min-width: 300px)' href='https://raw.githack.com/luizeletrica/tccv1/master/_css/tcc/small.css' />"
+   "<link rel='stylesheet' type='text/css' media='screen and (min-width: 800px)' href='https://raw.githack.com/luizeletrica/tccv1/master/_css/tcc/large.css' />"
+  
+
+"<body>"
+"<div id='interface'>"
+  
+  "<header id='cabecalho'>"
+  
+  "<h1>TOMADA BLUE</h1></br>"
+  "<h2>Seja bem-vindo USUARIO!</h2>"
+"<h3>*Esta e uma versao gratuita do Thinkspeak. Para remover o delay de 15s <a href='https://thingspeak.com/prices' target='_blank' >clique aqui!</a></h3>"  
+ 
+  
+  "</header>"
+  
+   " <div id='menu-equip'> <h2>Banheiro - Lampada</h2>"
+     
+    " <div id='tela_lamp'>"
+   
+    "  <iframe width='220' height='200'  src='https://thingspeak.com/channels/880282/widgets/114885'></iframe>"
+   "   <div id='botoes'>"
+    "  <div id='botao2'><a href='/releon'>ON</a></div>"
+   " <div id='botao'><a href='/releoff'>OFF</a></div>"
+" </div>"
+  "<div id='medcorrente'>"
+    " <iframe id='mymedcorrente' width='440' height='250' src='https://thingspeak.com/channels/880282/widgets/114884'></iframe>"
+   " </div>"
+  "</div>"
+  
+ " <div id='grafico'> <h3>Grafico</h3>"
+"<iframe id='mygrafico' width='450' height='235' style='border: 1px solid #cccccc;' src='https://thingspeak.com/channels/880282/charts/2?bgcolor=%23ffffff&color=%23d62020&dynamic=true&results=60&title=Potencia&type=line'></iframe>"
+   
+" </div>"
+    
+   " <div id='consumo'> <h3><a href='http://192.168.1.10/calcule' target='_blank' >Consumido W/h</a><a href='http://192.168.1.10/power' target='_blank' >(Historico)</a></h3>"
+ " <iframe id='myconsumo' width='450' height='120' style='border: 1px solid #cccccc;' src='https://thingspeak.com/channels/880282/widgets/114560'></iframe>"
+    "</div>"
+
+ " </div> "
+ " <div id='botao_voltar'><a href='https://raw.githack.com/luizeletrica/tccv1/master/_Equip/Banheiro/Banheiro.html'>VOLTAR</a></div>"
+ 
+
+"</div>"
+  
+  
+"<footer id='rodape'>"
+"<p>Copyright &copy; 2019 - by TREE BLUE <br/>"
+
+"</footer>"
+
+"</body>"
+
+   
+  "</html>";
+  
+  //Envia o html para o cliente com o código 200, que é o código quando a requisição foi realizada com sucesso
+  server.send(200, "text/html", html);
+}
+
+void showCalc()
+{
+  String html =
+  "<!DOCTYPE html>"
+   " <html lang='pt-br' >"
+  "<head>"
+   " <meta charset='UFT-8' name='viewport' content='width=device-width, initial-scale=1, user-scalable=no'/>"
+    "<title>Tomada Blue</title>"
+  
+  "<header id='cabecalho'>"
+  "<h1>TOMADA BLUE</h1>"
+  "<h2>Calcule sua conta</h2>"
+  
+   " </header>"
+  "<p>INSTRUCOES"
+  "<p>Para calcular sua conta, primeiro voce deve digitar o valor da bandeira tarifarica no mes."
+  "<p>Caso voce nao saiba o valor, clique na indicao abaixo. Em seguida, abrira uma nova aba com o site da CEMIG com o valor das bandeiras."
+  "<p>Na parte superior esquerda, mostrara qual e a bandeira do mes, e o valor a ser digitado sera ao correspondente da tabela."
+  "<p>O valor do imposto ate a data de 23/11/2019 e estimado de 0,35."
+  "<p>O valor do Consumo W/h, e o valor aparecido na tela anterior.<p>"
+  "<br>"
+  "<script>"
+"function multiplicar(){"
+
+"var Num1=document.getElementById('quociente').value;"
+"var Num2=document.getElementById('multiplicador').value;"
+"var Num3=document.getElementById('fixo').value;"
+
+"Num1=Number(Num1);"
+"Num2=Number(Num2);"
+"Num3=Number(Num3);"
+
+
+"var Num4=(Num1+Num3)*(Num2/1000);"
+
+"document.write('O Valor estimado da sua conta e = R$' + Num4);"
+"}"
+"</script>"
+
+"<body>"
+"Digite o valor da tarifa: (caso nao saiba  <a href='http://www.cemig.com.br/pt-br/atendimento/Paginas/valores_de_tarifa_e_servicos.aspx' target='_blank' >clique aqui!</a>)"
+"<input type='number' id='quociente' name='quociente' > "
+"<br>"
+"Digite o valor do imposto: (valor estimado de 0,35)"
+"<input type='number' id='fixo' name='fixo' value='0,35'>"
+"<br>"
+"Digite o valor do Consumo W/h:"
+"<input type='number' id='multiplicador' name='multiplicador'>"
+"<button type='button' onclick='multiplicar()'>Calcular</button>"
+
+"</body>"
+"</html>";
+//Envia o html para o cliente com o código 200, que é o código quando a requisição foi realizada com sucesso
+  server.send(200, "text/html", html);
+}
+
+void showpower()
+{
+  String html =
+  "<!DOCTYPE html>"
+   " <html lang='pt-br' >"
+  "<head>"
+   " <meta charset='UFT-8' name='viewport' content='width=device-width, initial-scale=1, user-scalable=no'/>"
+    "<title>Tomada Blue</title>"
+	
+	"<header id='cabecalho'>"
+	"<h1>TOMADA BLUE</h1>"
+  "<h2>Verifique se houve alguma queda de energia no mês</h2>"
+  
+   "<iframe width='450' height='260' style='border: 1px solid #cccccc;' src='https://thingspeak.com/channels/880282/charts/3?bgcolor=%23ffffff&color=%23d62020&dynamic=true&results=60&timescale=daily&type=line'></iframe>"
+
+"</body>"
+"</html>";
+//Envia o html para o cliente com o código 200, que é o código quando a requisição foi realizada com sucesso
+  server.send(200, "text/html", html);
+}
+
